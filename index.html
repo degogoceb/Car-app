@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="theme-color" content="#17222D" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<title>Car Maintenance</title>
+<style>html,body{margin:0;background:#E4E8EB}</style>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<noscript>This app needs JavaScript turned on.</noscript>
+<script>
+// Saves data in this browser using localStorage (same interface the app expects)
+window.storage = {
+  async get(key) { const v = localStorage.getItem(key); if (v === null) throw new Error("not found"); return { key, value: v, shared: false }; },
+  async set(key, value) { localStorage.setItem(key, value); return { key, value, shared: false }; },
+  async delete(key) { localStorage.removeItem(key); return { key, deleted: true, shared: false }; },
+  async list(prefix = "") { return { keys: Object.keys(localStorage).filter(k => k.startsWith(prefix)), prefix, shared: false }; }
+};
+</script>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+const KEY = "car-maintenance-v1";
+
+// miles: 0 = don't track by distance; months: 0 = don't track by time
+const DEFAULT_SERVICES = [
+  { name: "Engine oil & filter", miles: 5000, months: 6 },
+  { name: "Transmission fluid", miles: 60000, months: 48 },
+  { name: "Coolant", miles: 50000, months: 60 },
+  { name: "Engine air filter", miles: 15000, months: 12 },
+  { name: "Cabin air filter", miles: 15000, months: 12 },
+  { name: "Brake pads", miles: 40000, months: 0 },
+  { name: "Brake fluid", miles: 0, months: 24 },
+  { name: "Tire rotation", miles: 6000, months: 6 },
+  { name: "Tire replacement", miles: 50000, months: 72 },
+];
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+const pad = (n) => String(n).padStart(2, "0");
+const today = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+const parseDate = (s) => {
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(y, m - 1, d);
+};
+const addMonths = (date, m) => {
+  const d = new Date(date);
+  d.setMonth(d.getMonth() + m);
+  return d;
+};
+const startOfToday = () => {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+const fmt = (n) => Math.round(n).toLocaleString();
+const fmtDate = (d) =>
+  (typeof d === "string" ? parseDate(d) : d).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+const money = (n) =>
+  n.toLocaleString(undefined, { style: "currency", currency: "USD" });
+const parseNum = (s) => {
+  const n = Number(String(s).replace(/[, ]/g, ""));
+  return String(s).trim() !== "" && Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+};
+const humanDays = (d) => {
+  if (d < 45) return `${d} day${d === 1 ? "" : "s"}`;
+  if (d < 730) return `${Math.round(d / 30.4)} months`;
+  return `${(d / 365).toFixed(1)} years`;
+};
+
+function makeVehicle(name, mileage, units) {
+  const f = units === "km" ? 1.609 : 1;
+  return {
+    id: uid(),
+    name,
+    mileage,
+    mileageLog: [{ date: today(), miles: mileage }],
+    services: DEFAULT_SERVICES.map((s) => ({
+      id: uid(),
+      name: s.name,
+      intervalMiles: s.miles ? Math.round((s.miles * f) / 500) * 500 : 0,
+      intervalMonths: s.months,
+      records: [],
+    })),
+  };
+}
+
+function latest(s) {
+  if (!s.records.length) return null;
+  return [...s.records].sort(
+    (a, b) => b.miles - a.miles || (b.date > a.date ? 1 : -1)
+  )[0];
+}
+
+function computeStatus(s, mileage) {
+  const last = latest(s);
+  if (!last) return { state: "none", frac: 0, rank: 2 };
+  const fracs = [];
+  let milesLeft = null, daysLeft = null, dueMiles = null, dueDate = null;
+  if (s.intervalMiles > 0) {
+    dueMiles = last.miles + s.intervalMiles;
+    milesLeft = dueMiles - mileage;
+    fracs.push((mileage - last.miles) / s.intervalMiles);
+  }
+  if (s.intervalMonths > 0) {
+    const done = parseDate(last.date);
+    dueDate = addMonths(done, s.intervalMonths);
+    daysLeft = Math.round((dueDate - startOfToday()) / 864e5);
+    const total = Math.max(1, (dueDate - done) / 864e5);
+    fracs.push(1 - daysLeft / total);
+  }
+  const frac = Math.max(0, ...fracs);
+  let state = "ok";
+  if ((milesLeft !== null && milesLeft < 0) || (daysLeft !== null && daysLeft < 0)) state = "over";
+  else if (frac >= 0.85 || (daysLeft !== null && daysLeft <= 30)) state = "soon";
+  const rank = { over: 0, soon: 1, ok: 3 }[state];
+  return { state, frac, milesLeft, daysLeft, dueMiles, dueDate, last, rank };
+}
+
+const CHIP = { ok: "Good", soon: "Due soon", over: "Overdue", none: "No record yet" };
+
+/* ---------- UI pieces ---------- */
+
+function Odometer({ value, unit }) {
+  const digits = String(Math.max(0, Math.floor(value))).padStart(6, "0").split("");
+  const firstSig = digits.findIndex((d) => d !== "0");
+  return (
+    <div className="odo" role="img" aria-label={`${fmt(value)} ${unit}`}>
+      {digits.map((d, i) => (
+        <span
+          className={`drum ${firstSig === -1 ? i < digits.length - 1 : i < firstSig ? "lead" : ""}`}
+          key={digits.length - i}
+        >
+          <span className="strip" style={{ transform: `translateY(-${Number(d) * 10}%)` }}>
+            {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => (
+              <span key={n}>{n}</span>
+            ))}
+          </span>
+        </span>
+      ))}
+      <span className="odo-unit">{unit}</span>
+    </div>
+  );
+}
+
+function Sheet({ title, onClose, children }) {
+  useEffect(() => {
+    const k = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", k);
+    return () => window.removeEventListener("keydown", k);
+  }, [onClose]);
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div className="sheet" role="dialog" aria-label={title} onClick={(e) => e.stopPropagation()}>
+        <div className="sheet-head">
+          <h2>{title}</h2>
+          <button className="ghost sm" onClick={onClose}>Close</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, hint, children }) {
+  return (
+    <label className="field">
+      <span className="field-label">{label}</span>
+      {children}
+      {hint && <span className="hint">{hint}</span>}
+    </label>
+  );
+}
+
+function ServiceRow({ s, st, unit, onLog, onEdit, onDeleteRecord }) {
+  const [open, setOpen] = useState(false);
+  const [pendingDel, setPendingDel] = useState(null);
+  const parts = [];
+  if (st.milesLeft !== null)
+    parts.push(st.milesLeft >= 0 ? `${fmt(st.milesLeft)} ${unit} left` : `${fmt(-st.milesLeft)} ${unit} overdue`);
+  if (st.daysLeft !== null)
+    parts.push(st.daysLeft >= 0 ? `${humanDays(st.daysLeft)} left` : `${humanDays(-st.daysLeft)} overdue`);
+  const due = [];
+  if (st.dueMiles !== null) due.push(`at ${fmt(st.dueMiles)} ${unit}`);
+  if (st.dueDate) due.push(`by ${fmtDate(st.dueDate)}`);
+  const records = [...s.records].sort((a, b) => b.miles - a.miles);
+
+  return (
+    <li className="svc">
+      <div className="svc-head">
+        <h3>{s.name}</h3>
+        <span className={`chip ${st.state}`}>{CHIP[st.state]}</span>
+      </div>
+      {st.state !== "none" ? (
+        <>
+          <div className="bar" aria-hidden="true">
+            <span className={st.state} style={{ width: `${Math.min(100, st.frac * 100)}%` }} />
+          </div>
+          <p className="remaining">{parts.join(" or ")}</p>
+          <p className="sub">
+            Next {due.join(" or ")}{due.length > 1 ? ", whichever comes first" : ""}. Last done{" "}
+            {fmtDate(st.last.date)} at {fmt(st.last.miles)} {unit}.
+          </p>
+        </>
+      ) : (
+        <p className="sub">Log the last time this was done to start tracking it.</p>
+      )}
+      <div className="actions">
+        <button className="primary sm" onClick={onLog}>Log service</button>
+        {s.records.length > 0 && (
+          <button className="ghost sm" aria-expanded={open} onClick={() => setOpen(!open)}>
+            {open ? "Hide history" : `History (${s.records.length})`}
+          </button>
+        )}
+        <button className="ghost sm" onClick={onEdit}>Edit interval</button>
+      </div>
+      {open && (
+        <ul className="hist">
+          {records.map((r) => (
+            <li key={r.id}>
+              <div>
+                <strong>{fmtDate(r.date)}</strong> at {fmt(r.miles)} {unit}
+                {r.cost ? `, ${money(r.cost)}` : ""}
+                {r.notes && <div className="note">{r.notes}</div>}
+              </div>
+              <button
+                className="link"
+                onClick={() => {
+                  if (pendingDel === r.id) { onDeleteRecord(r.id); setPendingDel(null); }
+                  else setPendingDel(r.id);
+                }}
+              >
+                {pendingDel === r.id ? "Tap again to delete" : "Delete"}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
+
+function LogSheet({ service, unit, currentMiles, onSave, onClose }) {
+  const [date, setDate] = useState(today());
+  const [miles, setMiles] = useState(String(currentMiles));
+  const [cost, setCost] = useState("");
+  const [notes, setNotes] = useState("");
+  const [err, setErr] = useState("");
+  const save = () => {
+    const m = parseNum(miles);
+    if (m === null) return setErr(`Enter the odometer reading when this was done, in ${unit}.`);
+    if (!date) return setErr("Pick the date this was done.");
+    const c = cost.trim() === "" ? 0 : Number(cost.replace(/[$,]/g, ""));
+    if (!Number.isFinite(c) || c < 0) return setErr("Cost must be a number, like 64.99.");
+    onSave({ id: uid(), date, miles: m, cost: c, notes: notes.trim() });
+  };
+  return (
+    <Sheet title={`Log ${service.name.toLowerCase()}`} onClose={onClose}>
+      <Field label="Date done">
+        <input type="date" value={date} max={today()} onChange={(e) => setDate(e.target.value)} />
+      </Field>
+      <Field label={`Odometer (${unit})`}>
+        <input inputMode="numeric" value={miles} onChange={(e) => setMiles(e.target.value)} />
+      </Field>
+      <Field label="Cost (optional)">
+        <input inputMode="decimal" placeholder="0.00" value={cost} onChange={(e) => setCost(e.target.value)} />
+      </Field>
+      <Field label="Notes (optional)">
+        <input placeholder="Shop, parts, oil type…" value={notes} onChange={(e) => setNotes(e.target.value)} />
+      </Field>
+      {err && <p className="err">{err}</p>}
+      <button className="primary wide" onClick={save}>Save service</button>
+    </Sheet>
+  );
+}
+
+function ServiceSheet({ service, unit, onSave, onDelete, onClose }) {
+  const [name, setName] = useState(service?.name || "");
+  const [mi, setMi] = useState(service?.intervalMiles ? String(service.intervalMiles) : "");
+  const [mo, setMo] = useState(service?.intervalMonths ? String(service.intervalMonths) : "");
+  const [err, setErr] = useState("");
+  const [confirmDel, setConfirmDel] = useState(false);
+  const save = () => {
+    if (!name.trim()) return setErr("Give the service a name.");
+    const m = mi.trim() === "" ? 0 : parseNum(mi);
+    const t = mo.trim() === "" ? 0 : parseNum(mo);
+    if (m === null || t === null) return setErr("Intervals must be whole numbers.");
+    if (!m && !t) return setErr(`Set a distance interval, a time interval, or both.`);
+    onSave({ name: name.trim(), intervalMiles: m, intervalMonths: t });
+  };
+  return (
+    <Sheet title={service ? "Edit service" : "Add a service"} onClose={onClose}>
+      <Field label="Service name">
+        <input value={name} placeholder="e.g. Spark plugs" onChange={(e) => setName(e.target.value)} />
+      </Field>
+      <Field label={`Every how many ${unit}`} hint="Leave blank to track by time only.">
+        <input inputMode="numeric" value={mi} onChange={(e) => setMi(e.target.value)} />
+      </Field>
+      <Field label="Every how many months" hint="Leave blank to track by distance only.">
+        <input inputMode="numeric" value={mo} onChange={(e) => setMo(e.target.value)} />
+      </Field>
+      <p className="hint">Check your owner's manual for your car's recommended intervals.</p>
+      {err && <p className="err">{err}</p>}
+      <button className="primary wide" onClick={save}>{service ? "Save changes" : "Add service"}</button>
+      {service && (
+        <button
+          className="danger wide"
+          onClick={() => (confirmDel ? onDelete() : setConfirmDel(true))}
+        >
+          {confirmDel ? "Tap again to delete this service and its history" : "Delete service"}
+        </button>
+      )}
+    </Sheet>
+  );
+}
+
+function VehicleSheet({ vehicle, units, canDelete, onSave, onDelete, onClose }) {
+  const [name, setName] = useState(vehicle?.name || "");
+  const [miles, setMiles] = useState(vehicle ? String(vehicle.mileage) : "");
+  const [u, setU] = useState(units);
+  const [err, setErr] = useState("");
+  const [confirmDel, setConfirmDel] = useState(false);
+  const save = () => {
+    const m = parseNum(miles);
+    if (m === null) return setErr("Enter the odometer reading as a whole number.");
+    onSave({ name: name.trim() || "My car", mileage: m, units: u });
+  };
+  return (
+    <Sheet title={vehicle ? "Edit car" : "Add a car"} onClose={onClose}>
+      <Field label="Name">
+        <input value={name} placeholder="e.g. 2017 Civic" onChange={(e) => setName(e.target.value)} />
+      </Field>
+      <Field
+        label="Odometer reading"
+        hint={vehicle ? "Use this to correct a typo. For normal updates, use Update mileage." : null}
+      >
+        <input inputMode="numeric" value={miles} onChange={(e) => setMiles(e.target.value)} />
+      </Field>
+      <Field label="Distance units" hint="Changing units relabels numbers; it doesn't convert them.">
+        <select value={u} onChange={(e) => setU(e.target.value)}>
+          <option value="mi">Miles</option>
+          <option value="km">Kilometers</option>
+        </select>
+      </Field>
+      {err && <p className="err">{err}</p>}
+      <button className="primary wide" onClick={save}>{vehicle ? "Save changes" : "Add car"}</button>
+      {vehicle && canDelete && (
+        <button className="danger wide" onClick={() => (confirmDel ? onDelete() : setConfirmDel(true))}>
+          {confirmDel ? "Tap again to delete this car and all its records" : "Delete car"}
+        </button>
+      )}
+    </Sheet>
+  );
+}
+
+function Setup({ onDone }) {
+  const [name, setName] = useState("");
+  const [miles, setMiles] = useState("");
+  const [units, setUnits] = useState("mi");
+  const [err, setErr] = useState("");
+  return (
+    <div className="app setup">
+      <h1 className="setup-title">Set up your car</h1>
+      <p className="sub">Enter what's on the odometer now. You'll log past services next.</p>
+      <Field label="Name">
+        <input value={name} placeholder="e.g. 2017 Civic" onChange={(e) => setName(e.target.value)} />
+      </Field>
+      <Field label="Current odometer reading">
+        <input inputMode="numeric" placeholder="48210" value={miles} onChange={(e) => setMiles(e.target.value)} />
+      </Field>
+      <Field label="Distance units">
+        <select value={units} onChange={(e) => setUnits(e.target.value)}>
+          <option value="mi">Miles</option>
+          <option value="km">Kilometers</option>
+        </select>
+      </Field>
+      {err && <p className="err">{err}</p>}
+      <button
+        className="primary wide"
+        onClick={() => {
+          const m = parseNum(miles);
+          if (m === null) return setErr("Enter the current odometer reading, like 48210.");
+          onDone(name.trim() || "My car", m, units);
+        }}
+      >
+        Start tracking
+      </button>
+    </div>
+  );
+}
+
+/* ---------- App ---------- */
+
+function App() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [saveErr, setSaveErr] = useState(false);
+  const [sheet, setSheet] = useState(null);
+  const [editMiles, setEditMiles] = useState(false);
+  const [milesInput, setMilesInput] = useState("");
+  const [milesErr, setMilesErr] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get(KEY, false);
+        if (r && r.value) setData(JSON.parse(r.value));
+      } catch (e) { /* no saved data yet */ }
+      setLoading(false);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (loading || !data) return;
+    (async () => {
+      try {
+        const r = await window.storage.set(KEY, JSON.stringify(data), false);
+        setSaveErr(!r);
+      } catch (e) { setSaveErr(true); }
+    })();
+  }, [data, loading]);
+
+  const v = data ? data.vehicles.find((x) => x.id === data.activeId) || data.vehicles[0] : null;
+  const unit = data?.units || "mi";
+
+  const rows = useMemo(() => {
+    if (!v) return [];
+    return v.services
+      .map((s) => ({ s, st: computeStatus(s, v.mileage) }))
+      .sort((a, b) => a.st.rank - b.st.rank || b.st.frac - a.st.frac);
+  }, [v]);
+
+  if (loading) return <div className="app-root"><Styles /><p className="loading">Loading your garage…</p></div>;
+
+  if (!data) {
+    return (
+      <div className="app-root">
+        <Styles />
+        <Setup
+          onDone={(name, m, units) => {
+            const nv = makeVehicle(name, m, units);
+            setData({ units, activeId: nv.id, vehicles: [nv] });
+          }}
+        />
+      </div>
+    );
+  }
+
+  const updateVehicle = (fn) =>
+    setData((d) => ({ ...d, vehicles: d.vehicles.map((x) => (x.id === v.id ? fn(x) : x)) }));
+  const updateService = (sid, fn) =>
+    updateVehicle((x) => ({ ...x, services: x.services.map((s) => (s.id === sid ? fn(s) : s)) }));
+
+  const saveMiles = () => {
+    const m = parseNum(milesInput);
+    if (m === null) return setMilesErr("Enter a whole number.");
+    if (m < v.mileage)
+      return setMilesErr(`That's lower than the current reading of ${fmt(v.mileage)}. To fix a typo, use Edit car.`);
+    updateVehicle((x) => ({ ...x, mileage: m, mileageLog: [...x.mileageLog, { date: today(), miles: m }] }));
+    setEditMiles(false);
+    setMilesErr("");
+  };
+
+  const counts = rows.reduce((a, r) => ((a[r.st.state] = (a[r.st.state] || 0) + 1), a), {});
+  const summary = [
+    counts.over && `${counts.over} overdue`,
+    counts.soon && `${counts.soon} due soon`,
+    counts.none && `${counts.none} without a record`,
+  ].filter(Boolean);
+  const spent = v.services.reduce((t, s) => t + s.records.reduce((u, r) => u + (r.cost || 0), 0), 0);
+  const lastUpdate = v.mileageLog[v.mileageLog.length - 1]?.date;
+  const activeService = sheet?.sid ? v.services.find((s) => s.id === sheet.sid) : null;
+
+  return (
+    <div className="app-root">
+      <Styles />
+      <div className="app">
+        <header className="top">
+          {data.vehicles.length > 1 ? (
+            <select
+              className="vsel"
+              aria-label="Choose car"
+              value={v.id}
+              onChange={(e) => setData((d) => ({ ...d, activeId: e.target.value }))}
+            >
+              {data.vehicles.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+            </select>
+          ) : (
+            <h1>{v.name}</h1>
+          )}
+          <div className="top-actions">
+            <button className="ghost sm" onClick={() => setSheet({ type: "vehicle", edit: true })}>Edit car</button>
+            <button className="ghost sm" onClick={() => setSheet({ type: "vehicle", edit: false })}>Add car</button>
+          </div>
+        </header>
+
+        <section className="dash">
+          <Odometer value={v.mileage} unit={unit} />
+          {lastUpdate && <p className="dash-meta">Last updated {fmtDate(lastUpdate)}</p>}
+          {editMiles ? (
+            <div className="miles-form">
+              <input
+                autoFocus
+                inputMode="numeric"
+                aria-label={`New odometer reading in ${unit}`}
+                value={milesInput}
+                onChange={(e) => setMilesInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && saveMiles()}
+              />
+              <button className="sign" onClick={saveMiles}>Save</button>
+              <button className="ghost-dark" onClick={() => { setEditMiles(false); setMilesErr(""); }}>Cancel</button>
+              {milesErr && <p className="err light">{milesErr}</p>}
+            </div>
+          ) : (
+            <button
+              className="sign"
+              onClick={() => { setMilesInput(String(v.mileage)); setEditMiles(true); }}
+            >
+              Update mileage
+            </button>
+          )}
+        </section>
+
+        <p className="summary">
+          {summary.length ? summary.join(", ") + "." : "Everything is up to date."}
+        </p>
+
+        <ul className="services">
+          {rows.map(({ s, st }) => (
+            <ServiceRow
+              key={s.id}
+              s={s}
+              st={st}
+              unit={unit}
+              onLog={() => setSheet({ type: "log", sid: s.id })}
+              onEdit={() => setSheet({ type: "service", sid: s.id })}
+              onDeleteRecord={(rid) =>
+                updateService(s.id, (x) => ({ ...x, records: x.records.filter((r) => r.id !== rid) }))
+              }
+            />
+          ))}
+        </ul>
+
+        <button className="ghost wide" onClick={() => setSheet({ type: "service", sid: null })}>
+          Add a service
+        </button>
+
+        {spent > 0 && <p className="foot">Spent on maintenance so far: {money(spent)}</p>}
+        {saveErr && <p className="err">Changes couldn't be saved. They'll stay until you close this page.</p>}
+      </div>
+
+      {sheet?.type === "log" && activeService && (
+        <LogSheet
+          service={activeService}
+          unit={unit}
+          currentMiles={v.mileage}
+          onClose={() => setSheet(null)}
+          onSave={(rec) => {
+            updateVehicle((x) => ({
+              ...x,
+              mileage: Math.max(x.mileage, rec.miles),
+              mileageLog: rec.miles > x.mileage ? [...x.mileageLog, { date: rec.date, miles: rec.miles }] : x.mileageLog,
+              services: x.services.map((s) => (s.id === activeService.id ? { ...s, records: [...s.records, rec] } : s)),
+            }));
+            setSheet(null);
+          }}
+        />
+      )}
+
+      {sheet?.type === "service" && (
+        <ServiceSheet
+          service={activeService}
+          unit={unit}
+          onClose={() => setSheet(null)}
+          onSave={(vals) => {
+            if (activeService) updateService(activeService.id, (s) => ({ ...s, ...vals }));
+            else updateVehicle((x) => ({ ...x, services: [...x.services, { id: uid(), records: [], ...vals }] }));
+            setSheet(null);
+          }}
+          onDelete={() => {
+            updateVehicle((x) => ({ ...x, services: x.services.filter((s) => s.id !== activeService.id) }));
+            setSheet(null);
+          }}
+        />
+      )}
+
+      {sheet?.type === "vehicle" && (
+        <VehicleSheet
+          vehicle={sheet.edit ? v : null}
+          units={unit}
+          canDelete={data.vehicles.length > 1}
+          onClose={() => setSheet(null)}
+          onSave={({ name, mileage, units }) => {
+            if (sheet.edit) {
+              setData((d) => ({
+                ...d,
+                units,
+                vehicles: d.vehicles.map((x) =>
+                  x.id === v.id
+                    ? {
+                        ...x,
+                        name,
+                        mileage,
+                        mileageLog: mileage !== x.mileage ? [...x.mileageLog, { date: today(), miles: mileage }] : x.mileageLog,
+                      }
+                    : x
+                ),
+              }));
+            } else {
+              const nv = makeVehicle(name, mileage, units);
+              setData((d) => ({ ...d, units, activeId: nv.id, vehicles: [...d.vehicles, nv] }));
+            }
+            setSheet(null);
+          }}
+          onDelete={() => {
+            setData((d) => {
+              const rest = d.vehicles.filter((x) => x.id !== v.id);
+              return { ...d, vehicles: rest, activeId: rest[0].id };
+            });
+            setSheet(null);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function Styles() {
+  return (
+    <style>{`
+@import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700&display=swap');
+.app-root{--bg:#E4E8EB;--panel:#FFFFFF;--ink:#17222D;--muted:#566472;--line:#CDD3D9;--sign:#F2B705;
+  --ok:#2F7D4A;--soon:#A86400;--over:#B3261E;--focus:#2A6BD1;
+  font-family:'Barlow',system-ui,sans-serif;font-size:16px;line-height:1.45;color:var(--ink);background:var(--bg);min-height:100vh}
+.app-root *{box-sizing:border-box}
+.app{max-width:620px;margin:0 auto;padding:20px 16px 56px}
+.app-root h1,.app-root h2,.app-root h3{font-family:'Barlow Condensed',sans-serif;font-weight:600;margin:0;line-height:1.1}
+.loading{text-align:center;padding:80px 16px;color:var(--muted)}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.top h1{font-size:30px}
+.top-actions{display:flex;gap:6px}
+.vsel{font:600 28px 'Barlow Condensed',sans-serif;background:transparent;border:none;color:var(--ink);max-width:60vw;padding:0}
+.dash{margin:16px 0 0;padding:24px 16px 20px;background:var(--ink);color:#fff;border-radius:16px;text-align:center}
+.odo{display:inline-flex;align-items:flex-end;gap:4px;font:700 clamp(42px,13vw,66px)/1 'Barlow Condensed',sans-serif}
+.drum{display:block;height:1.12em;width:.66em;overflow:hidden;background:#2B3A47;border-radius:5px;
+  box-shadow:inset 0 .14em .18em rgba(0,0,0,.5),inset 0 -.14em .18em rgba(0,0,0,.5)}
+.drum.lead{color:rgba(255,255,255,.3)}
+.strip{display:flex;flex-direction:column;transition:transform .8s cubic-bezier(.2,.8,.2,1)}
+.strip span{height:1.12em;display:flex;align-items:center;justify-content:center}
+.odo-unit{font:600 20px 'Barlow Condensed',sans-serif;color:var(--sign);margin-left:6px;padding-bottom:4px}
+.dash-meta{margin:10px 0 14px;font-size:14px;color:#B7C2CC}
+.miles-form{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+.miles-form input{width:150px;font:600 20px 'Barlow Condensed',sans-serif;padding:8px 10px;border-radius:8px;border:none;text-align:center}
+.summary{font:500 20px 'Barlow Condensed',sans-serif;margin:22px 2px 8px}
+.services{list-style:none;margin:0 0 14px;padding:0;background:var(--panel);border:1px solid var(--line);border-radius:12px}
+.svc{padding:16px 16px 14px;border-top:1px solid var(--line)}
+.svc:first-child{border-top:none}
+.svc-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.svc h3{font-size:21px}
+.chip{font-size:13px;font-weight:600;padding:2px 9px;border-radius:999px;white-space:nowrap}
+.chip.ok{color:var(--ok);background:#E3F1E7}.chip.soon{color:var(--soon);background:#FBEFD8}
+.chip.over{color:#fff;background:var(--over)}.chip.none{color:var(--muted);background:#EDF0F2}
+.bar{height:6px;background:#E3E7EA;border-radius:3px;margin:10px 0 8px;overflow:hidden}
+.bar span{display:block;height:100%;border-radius:3px;transition:width .5s}
+.bar .ok{background:var(--ok)}.bar .soon{background:#D89400}.bar .over{background:var(--over)}
+.remaining{margin:0;font-weight:600}
+.sub{margin:2px 0 0;color:var(--muted);font-size:15px}
+.actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+.hist{list-style:none;margin:12px 0 0;padding:0;border-left:3px solid var(--line)}
+.hist li{display:flex;justify-content:space-between;gap:10px;padding:6px 0 6px 12px;font-size:15px}
+.note{color:var(--muted)}
+.foot{color:var(--muted);text-align:center;margin-top:18px}
+.app-root button{font:600 15px 'Barlow',sans-serif;border-radius:8px;cursor:pointer;padding:10px 16px;border:1px solid transparent}
+.app-root button.sm{padding:6px 12px;font-size:14px}
+.app-root button.wide{width:100%;margin-top:10px}
+.primary{background:var(--ink);color:#fff}
+.primary:hover{background:#2B3A47}
+.ghost{background:transparent;color:var(--ink);border-color:var(--line)!important}
+.ghost:hover{background:#fff}
+.sign{background:var(--sign);color:var(--ink)}
+.sign:hover{background:#FFC928}
+.ghost-dark{background:transparent;color:#fff;border-color:#4A5A68!important}
+.danger{background:transparent;color:var(--over);border-color:#E5B5B1!important}
+.link{background:none!important;border:none!important;padding:0!important;color:var(--over);font-size:14px!important;white-space:nowrap}
+.app-root :focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+.overlay{position:fixed;inset:0;background:rgba(23,34,45,.55);display:flex;align-items:flex-end;justify-content:center;z-index:50}
+.sheet{background:var(--panel);width:100%;max-width:620px;max-height:90vh;overflow:auto;border-radius:16px 16px 0 0;padding:18px 18px 28px}
+@media(min-width:700px){.overlay{align-items:center}.sheet{border-radius:16px}}
+.sheet-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.sheet-head h2{font-size:24px}
+.field{display:block;margin:12px 0}
+.field-label{display:block;font-weight:600;font-size:15px;margin-bottom:4px}
+.field input,.field select{width:100%;font:16px 'Barlow',sans-serif;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}
+.hint{display:block;font-size:14px;color:var(--muted);margin-top:4px}
+.err{color:var(--over);font-weight:500;margin:8px 0 0}
+.err.light{color:#FFB4AB;width:100%}
+.setup{padding-top:48px}
+.setup-title{font-size:38px}
+@media (prefers-reduced-motion:reduce){.strip,.bar span{transition:none}}
+`}</style>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
